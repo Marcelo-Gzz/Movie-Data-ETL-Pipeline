@@ -1,6 +1,7 @@
 import os
 import requests
 import psycopg2
+import time
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
@@ -132,6 +133,94 @@ def load_movie_genres(conn, movies: list[dict]):
     conn.commit()
     print(f"Inserted {len(rows)} movie_genre links ")
 
+def fetch_movie_credits(tmdb_movie_id: int) -> dict:
+    """
+    Returns credits JSON for a movie: { cast: [...], crew: [...] }
+    """
+    return tmdb_get(f"/movie/{tmdb_movie_id}/credits")
+
+def upsert_actors(conn, actors: list[dict]):
+    """
+    Upsert actors into actors table.
+    """
+    rows = []
+    for a in actors:
+        rows.append((
+            a["id"],                 # tmdb_person_id
+            a.get("name"),
+            a.get("gender"),
+            a.get("popularity"),
+        ))
+
+    if not rows:
+        return
+
+    sql = """
+        INSERT INTO actors (tmdb_person_id, name, gender, popularity)
+        VALUES %s
+        ON CONFLICT (tmdb_person_id)
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          gender = EXCLUDED.gender,
+          popularity = EXCLUDED.popularity
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows)
+    conn.commit()
+
+def load_movie_actors(conn, tmdb_movie_id: int, cast: list[dict], top_n: int = 15):
+    """
+    Populate movie_actor for a single movie.
+    We usually cap to top N billed cast to keep the dataset manageable at first.
+    """
+    rows = []
+    for a in cast[:top_n]:
+        rows.append((
+            tmdb_movie_id,
+            a["id"],                 # tmdb_person_id
+            a.get("order"),
+            a.get("character"),
+        ))
+
+    if not rows:
+        return
+
+    sql = """
+        INSERT INTO movie_actor (tmdb_movie_id, tmdb_person_id, cast_order, character_name)
+        VALUES %s
+        ON CONFLICT (tmdb_movie_id, tmdb_person_id)
+        DO UPDATE SET
+          cast_order = EXCLUDED.cast_order,
+          character_name = EXCLUDED.character_name
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows)
+    conn.commit()
+
+def load_cast_for_movies(conn, movies: list[dict], top_n_cast: int = 15, sleep_s: float = 0.25):
+    """
+    For each movie: fetch credits, upsert actors, upsert movie_actor links.
+    sleep_s is a small delay to be polite to the API and avoid rate limits.
+    """
+    total_movies = len(movies)
+    for i, m in enumerate(movies, start=1):
+        tmdb_movie_id = m["id"]
+
+        print(f"[{i}/{total_movies}] credits for movie {tmdb_movie_id} ...")
+        credits = fetch_movie_credits(tmdb_movie_id)
+        cast = credits.get("cast", [])
+
+        # Upsert all cast members into actors table
+        upsert_actors(conn, cast)
+
+        # Link top N cast into movie_actor
+        load_movie_actors(conn, tmdb_movie_id, cast, top_n=top_n_cast)
+
+        time.sleep(sleep_s)
+
+
 def dedupe_by_tmdb_id(movies: list[dict]) -> list[dict]:
     """
     Remove duplicates by TMDB movie id while preserving the latest occurrence.
@@ -175,6 +264,9 @@ def main():
         print(f"Upserted {len(popular_movies)} movies ")
 
         load_movie_genres(conn, popular_movies)
+
+        load_cast_for_movies(conn, popular_movies, top_n_cast=15, sleep_s=0.25)
+        print("Loaded actors + movie_actor ")
 
     finally:
         conn.close()
