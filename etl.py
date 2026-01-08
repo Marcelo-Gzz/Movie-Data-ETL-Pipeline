@@ -103,6 +103,59 @@ def upsert_movies(conn, movies: list[dict]):
         execute_values(cur, sql, rows)
     conn.commit()
 
+def load_movie_genres(conn, movies: list[dict]):
+    """
+    Populate movie_genre junction table from /movie/popular data.
+    Uses INSERT ... ON CONFLICT DO NOTHING so it’s safe to rerun.
+    """
+    rows = []
+
+    for m in movies:
+        tmdb_movie_id = m["id"]
+        for tmdb_genre_id in m.get("genre_ids", []):
+            rows.append((tmdb_movie_id, tmdb_genre_id))
+
+    if not rows:
+        print("No movie_genre rows to insert")
+        return
+
+    sql = """
+        INSERT INTO movie_genre (tmdb_movie_id, tmdb_genre_id)
+        VALUES %s
+        ON CONFLICT (tmdb_movie_id, tmdb_genre_id)
+        DO NOTHING
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows)
+
+    conn.commit()
+    print(f"Inserted {len(rows)} movie_genre links ")
+
+def dedupe_by_tmdb_id(movies: list[dict]) -> list[dict]:
+    """
+    Remove duplicates by TMDB movie id while preserving the latest occurrence.
+    """
+    by_id = {}
+    for m in movies:
+        by_id[m["id"]] = m
+    return list(by_id.values())
+
+def print_duplicate_movie_ids(movies: list[dict]):
+    seen = set()
+    dups = set()
+    for m in movies:
+        mid = m["id"]
+        if mid in seen:
+            dups.add(mid)
+        seen.add(mid)
+    if dups:
+        print("Duplicate TMDB movie IDs found:", sorted(list(dups))[:20])
+    else:
+        print("No duplicate TMDB movie IDs found")
+
+
+
 def main():
     conn = get_conn()
     try:
@@ -113,8 +166,15 @@ def main():
 
         
         popular_movies = fetch_popular_movies(pages=2)
+        print_duplicate_movie_ids(popular_movies)
+
+        popular_movies = dedupe_by_tmdb_id(popular_movies)
+        print(f"After dedupe: {len(popular_movies)} unique movies")
+
         upsert_movies(conn, popular_movies)
         print(f"Upserted {len(popular_movies)} movies ")
+
+        load_movie_genres(conn, popular_movies)
 
     finally:
         conn.close()
